@@ -24,8 +24,14 @@ let lastAutoSyncAt = 0;
 
 function resolveHardware(name = "", remark = "", fallbackModel = "Pixel 5") {
   const lower = (name + " " + remark).trim().toLowerCase();
-  if (lower.includes("redmi") || lower.includes("xiaomi")) {
+    if (lower.includes("note 9")) {
+    return { brand: "Xiaomi", model: "M2010J19SC" };
+  }
+  if (lower.includes("note 12")) {
     return { brand: "Xiaomi", model: "23021RAA2Y" };
+  }
+  if (lower.includes("redmi") || lower.includes("xiaomi")) {
+    return { brand: "Xiaomi", model: modelCodes[fallbackModel] ?? "M2010J19SC" };
   }
   if (lower.includes("pixel 5")) {
     return { brand: "Google", model: "Pixel 5" };
