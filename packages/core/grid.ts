@@ -12,9 +12,9 @@ export class InputError extends Error {
 
 export const phoneModels: Record<string, string[]> = {
   Samsung: ['Galaxy S23 Ultra', 'Galaxy S24+', 'Galaxy Z Fold5'],
-  Google: ['Pixel 8 Pro', 'Pixel 7', 'Pixel 8a'],
+  Google: ['Pixel 8 Pro', 'Pixel 7', 'Pixel 8a', 'Pixel 5'],
   Motorola: ['Moto Edge 40', 'Moto G Stylus 5G'],
-  Xiaomi: ['Xiaomi 13 Pro', 'Redmi Note 12'],
+  Xiaomi: ['Xiaomi 13 Pro', 'Redmi Note 12', 'Redmi Note 9'],
 };
 export function parseSpec(input: Record<string, unknown>) {
   const { keyword, targetBusiness, centerLat, centerLng } = input;

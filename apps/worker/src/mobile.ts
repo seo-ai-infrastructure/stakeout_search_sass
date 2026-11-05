@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { mkdtemp, writeFile, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -14,45 +14,48 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 type Pin = GridPin & { scan: GridScan };
 
 const bootstrappedInMemory = new Set<string>();
+const RT_DIR = '/data/local/tmp/rt';
+const RUNNER_SHA = createHash('sha256').update(RUN_PIN_SH_V2).digest('hex');
+
+async function pushFileChunked(
+  imageId: string,
+  path: string,
+  content: string,
+  mode = '755',
+) {
+  const tmp = path + '.b64';
+  const chunks =
+    Buffer.from(content, 'utf8').toString('base64').match(/.{1,700}/g) ?? [];
+  const run = (command: string) =>
+    duoplusPost('/api/v1/cloudPhone/command', { image_id: imageId, command });
+
+  await run(`mkdir -p ${RT_DIR}`);
+  await run(`rm -f ${tmp} ${path}`);
+  for (const chunk of chunks) {
+    await run(`echo -n ${chunk} >> ${tmp}`);
+  }
+  await run(`base64 -d ${tmp} > ${path}`);
+  await run(`chmod ${mode} ${path}`);
+  await run(`rm -f ${tmp}`);
+}
 
 async function ensureRunnerInstalled(imageId: string) {
   if (bootstrappedInMemory.has(imageId)) return;
-  try {
-    const check = await duoplusPost('/api/v1/cloudPhone/command', {
-      image_id: imageId,
-      command: 'ls /data/local/tmp/rt/run_pin.sh',
-    });
-    if (String(check?.data?.content ?? '').includes('run_pin.sh')) {
-      bootstrappedInMemory.add(imageId);
-      return;
-    }
-  } catch {
-    // Proceed to chunked install if missing
+
+  const check = await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: imageId,
+    command: `cat ${RT_DIR}/run_pin.sha`,
+  }).catch(() => null);
+
+  if (String(check?.data?.content ?? '').trim() === RUNNER_SHA) {
+    bootstrappedInMemory.add(imageId);
+    return;
   }
 
-  const b64 = Buffer.from(RUN_PIN_SH_V2, 'utf8').toString('base64');
-  const chunks = b64.match(/.{1,700}/g) || [];
+  await pushFileChunked(imageId, `${RT_DIR}/run_pin.sh`, RUN_PIN_SH_V2);
   await duoplusPost('/api/v1/cloudPhone/command', {
     image_id: imageId,
-    command: 'mkdir -p /data/local/tmp/rt',
-  });
-  await duoplusPost('/api/v1/cloudPhone/command', {
-    image_id: imageId,
-    command: 'rm -f /data/local/tmp/rt/run_pin.b64 /data/local/tmp/rt/run_pin.sh',
-  });
-  for (const chunk of chunks) {
-    await duoplusPost('/api/v1/cloudPhone/command', {
-      image_id: imageId,
-      command: `echo -n ${chunk} >> /data/local/tmp/rt/run_pin.b64`,
-    });
-  }
-  await duoplusPost('/api/v1/cloudPhone/command', {
-    image_id: imageId,
-    command: 'base64 -d /data/local/tmp/rt/run_pin.b64 > /data/local/tmp/rt/run_pin.sh',
-  });
-  await duoplusPost('/api/v1/cloudPhone/command', {
-    image_id: imageId,
-    command: 'chmod 755 /data/local/tmp/rt/run_pin.sh',
+    command: `echo ${RUNNER_SHA} > ${RT_DIR}/run_pin.sha`,
   });
   bootstrappedInMemory.add(imageId);
 }
@@ -190,32 +193,14 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
   const launchScript = [
     '#!/system/bin/sh',
     `export UPLOAD_URL=${shellQuote(detachedUpload ? '' : putUrl)}`,
-    `nohup sh /data/local/tmp/rt/run_pin.sh ${args.join(' ')} >/data/local/tmp/rt/last_run.log 2>&1 &`,
+    `nohup sh ${RT_DIR}/run_pin.sh ${args.join(' ')} >${RT_DIR}/last_run.log 2>&1 &`,
     'exit 0',
   ].join('\n');
 
-  const launchChunks = Buffer.from(launchScript, 'utf8').toString('base64').match(/.{1,700}/g) || [];
+  await pushFileChunked(d.imageId, `${RT_DIR}/launch.sh`, launchScript);
   await duoplusPost('/api/v1/cloudPhone/command', {
     image_id: d.imageId,
-    command: 'rm -f /data/local/tmp/rt/launch.b64 /data/local/tmp/rt/launch.sh',
-  });
-  for (const chunk of launchChunks) {
-    await duoplusPost('/api/v1/cloudPhone/command', {
-      image_id: d.imageId,
-      command: `echo -n ${chunk} >> /data/local/tmp/rt/launch.b64`,
-    });
-  }
-  await duoplusPost('/api/v1/cloudPhone/command', {
-    image_id: d.imageId,
-    command: 'base64 -d /data/local/tmp/rt/launch.b64 > /data/local/tmp/rt/launch.sh',
-  });
-  await duoplusPost('/api/v1/cloudPhone/command', {
-    image_id: d.imageId,
-    command: 'chmod 755 /data/local/tmp/rt/launch.sh',
-  });
-  await duoplusPost('/api/v1/cloudPhone/command', {
-    image_id: d.imageId,
-    command: 'sh /data/local/tmp/rt/launch.sh',
+    command: `sh ${RT_DIR}/launch.sh`,
   });
 
   const deadline = Date.now() + 240000;
@@ -230,7 +215,7 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
   }
 
   if (detachedUpload) {
-    const folder = '/data/local/tmp/rt/' + tag;
+    const folder = `${RT_DIR}/${tag}`;
     let ready = false;
     while (Date.now() < deadline) {
       await d.assertOwned();
@@ -253,16 +238,13 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
       const file = shellQuote(folder + '.tar.gz');
       const sendScript = [
         '#!/system/bin/sh',
-        `curl --max-time 90 -fsS -H 'Content-Type: application/gzip' -T ${file} ${shellQuote(putUrl)} && rm -f ${file} && rm -rf ${shellQuote(folder)}`,
+        `nohup sh -c "curl --max-time 90 -fsS -H 'Content-Type: application/gzip' -T ${file} ${shellQuote(putUrl)} && rm -f ${file} && rm -rf ${shellQuote(folder)}" >${RT_DIR}/last_send.log 2>&1 &`,
+        'exit 0',
       ].join('\n');
-      const sendB64 = Buffer.from(sendScript, 'utf8').toString('base64');
+      await pushFileChunked(d.imageId, `${RT_DIR}/send.sh`, sendScript);
       await duoplusPost('/api/v1/cloudPhone/command', {
         image_id: d.imageId,
-        command: `echo ${sendB64} | base64 -d > /data/local/tmp/rt/send.sh`,
-      });
-      await duoplusPost('/api/v1/cloudPhone/command', {
-        image_id: d.imageId,
-        command: 'nohup sh /data/local/tmp/rt/send.sh >/dev/null 2>&1 &',
+        command: `sh ${RT_DIR}/send.sh`,
       });
       await waitForUpload();
     } finally {

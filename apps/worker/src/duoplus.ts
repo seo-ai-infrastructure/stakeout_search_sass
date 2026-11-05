@@ -16,7 +16,8 @@ export const modelCodes: Record<string, string> = {
   "Moto G Stylus 5G": "XT2315-1",
   "Xiaomi 13 Pro": "2210132G",
   "Redmi Note 12": "23021RAA2Y",
-  "Xiaomi Redmi Note": "23021RAA2Y",
+  "Xiaomi Redmi Note": "M2010J19SC",
+  "Redmi Note 9": "M2010J19SC",
 };
 
 let lastAutoSyncAt = 0;
@@ -57,8 +58,9 @@ export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Pixel 5") {
     if (!poweredOn.length) return [];
 
     const activeIds = poweredOn.map((item: any) => String(item.id));
-    await db.devicePool.deleteMany({
+    await db.devicePool.updateMany({
       where: { imageId: { notIn: activeIds } },
+      data: { isEnabled: false },
     });
 
     const proxyRes = await duoplusPost("/api/v1/proxy/list", { page: 1, pagesize: 100 }).catch(() => null);
