@@ -28,12 +28,24 @@ function resolveHardware(name = "", remark = "", fallbackModel = "Galaxy S23 Ult
 export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Galaxy S23 Ultra") {
   if (!process.env.DUOPLUS_API_KEY) return [];
   try {
-    const res = await duoplusPost("/api/v1/cloudPhone/list", { page: 1, pagesize: 100 });
+    const res = await duoplusPost("/api/v1/cloudPhone/list", {
+      page: 1,
+      pagesize: 100,
+      link_status: ["1"],
+      adb_status: ["1"],
+    });
     const list = res?.data?.list ?? [];
-    const usable = list
-      .filter((item: any) => item?.id && [1, 2].includes(Number(item.status)))
-      .sort((a: any, b: any) => Number(a.status) - Number(b.status));
-    if (!usable.length) return [];
+    // Strictly keep only Powered On (status === 1) devices with a live ADB address
+    const poweredOn = list.filter(
+      (item: any) => item?.id && Number(item.status) === 1 && item.adb
+    );
+    if (!poweredOn.length) return [];
+
+    const activeIds = poweredOn.map((item: any) => String(item.id));
+    // Disable or remove any pool records that are no longer powered on
+    await db.devicePool.deleteMany({
+      where: { imageId: { notIn: activeIds } },
+    });
 
     const proxyRes = await duoplusPost("/api/v1/proxy/list", { page: 1, pagesize: 100 }).catch(() => null);
     const proxies: string[] = (proxyRes?.data?.list ?? []).map((px: any) => String(px.id));
@@ -44,11 +56,11 @@ export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Galaxy S23 Ult
     const now = new Date();
     const synced = [];
 
-    for (let i = 0; i < usable.length; i++) {
-      const item = usable[i];
+    for (let i = 0; i < poweredOn.length; i++) {
+      const item = poweredOn[i];
       const imageId = String(item.id);
       const hw = resolveHardware(item.name, item.remark, fallbackPhoneModel);
-      const adbAddr = item.adb ? String(item.adb) : null;
+      const adbAddr = String(item.adb);
       const currentRecord = existingPool.find((d) => d.imageId === imageId);
 
       let candidateProxy = item.proxy_id ? String(item.proxy_id) : proxies[i] || "proxy-" + imageId;
@@ -96,6 +108,7 @@ export async function acquireDeviceLease(pinId: string, phoneModel: string) {
       where: {
         isEnabled: true,
         bootstrappedAt: { not: null },
+        adbAddr: { not: null },
         hardwareModel: { in: [model, phoneModel], mode: "insensitive" },
       },
       orderBy: { slotIndex: "asc" },
@@ -111,9 +124,8 @@ export async function acquireDeviceLease(pinId: string, phoneModel: string) {
 
   const store = redis();
   const now = new Date();
-  const sorted = [...available].sort((a, b) => (b.adbAddr ? 1 : 0) - (a.adbAddr ? 1 : 0));
 
-  for (const d of sorted) {
+  for (const d of available) {
     if (d.cooldownUntil && d.cooldownUntil > now) continue;
     const key = "lock:duoplus:" + d.imageId,
       token = pinId + "|" + randomUUID();
