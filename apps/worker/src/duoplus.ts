@@ -10,22 +10,38 @@ export const modelCodes: Record<string, string> = {
   "Pixel 8 Pro": "Pixel 8 Pro",
   "Pixel 7": "Pixel 7",
   "Pixel 8a": "Pixel 8a",
+  "Pixel 5": "Pixel 5",
+  "Google Pixel 5": "Pixel 5",
   "Moto Edge 40": "XT2303-2",
   "Moto G Stylus 5G": "XT2315-1",
   "Xiaomi 13 Pro": "2210132G",
   "Redmi Note 12": "23021RAA2Y",
+  "Xiaomi Redmi Note": "23021RAA2Y",
 };
 
 let lastAutoSyncAt = 0;
 
-function resolveHardware(name = "", remark = "", fallbackModel = "Galaxy S23 Ultra") {
+function resolveHardware(name = "", remark = "", fallbackModel = "Pixel 5") {
   const lower = (name + " " + remark).trim().toLowerCase();
-  if (lower.includes("pixel 8")) return { brand: "Google", model: "Pixel 8 Pro" };
-  if (lower.includes("pixel")) return { brand: "Google", model: "Pixel 7" };
-  return { brand: "Samsung", model: modelCodes[fallbackModel] ?? fallbackModel };
+  if (lower.includes("redmi") || lower.includes("xiaomi")) {
+    return { brand: "Xiaomi", model: "23021RAA2Y" };
+  }
+  if (lower.includes("pixel 5")) {
+    return { brand: "Google", model: "Pixel 5" };
+  }
+  if (lower.includes("pixel 8")) {
+    return { brand: "Google", model: "Pixel 8 Pro" };
+  }
+  if (lower.includes("pixel")) {
+    return { brand: "Google", model: "Pixel 5" };
+  }
+  return {
+    brand: fallbackModel.toLowerCase().includes("redmi") ? "Xiaomi" : "Google",
+    model: modelCodes[fallbackModel] ?? fallbackModel,
+  };
 }
 
-export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Galaxy S23 Ultra") {
+export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Pixel 5") {
   if (!process.env.DUOPLUS_API_KEY) return [];
   try {
     const res = await duoplusPost("/api/v1/cloudPhone/list", {
@@ -35,14 +51,12 @@ export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Galaxy S23 Ult
       adb_status: ["1"],
     });
     const list = res?.data?.list ?? [];
-    // Strictly keep only Powered On (status === 1) devices with a live ADB address
     const poweredOn = list.filter(
       (item: any) => item?.id && Number(item.status) === 1 && item.adb
     );
     if (!poweredOn.length) return [];
 
     const activeIds = poweredOn.map((item: any) => String(item.id));
-    // Disable or remove any pool records that are no longer powered on
     await db.devicePool.deleteMany({
       where: { imageId: { notIn: activeIds } },
     });
@@ -74,7 +88,7 @@ export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Galaxy S23 Ult
         where: { imageId },
         update: {
           proxyId: currentRecord?.proxyId || candidateProxy,
-          hardwareBrand: hw.brand,
+          hardwareBrand: currentRecord?.hardwareBrand || hw.brand,
           hardwareModel: currentRecord?.hardwareModel || hw.model,
           adbAddr,
           isEnabled: true,
@@ -103,8 +117,10 @@ export async function syncDuoPlusDevicePool(fallbackPhoneModel = "Galaxy S23 Ult
 
 export async function acquireDeviceLease(pinId: string, phoneModel: string) {
   const model = modelCodes[phoneModel] ?? phoneModel;
-  const findMatchingDevices = () =>
-    db.devicePool.findMany({
+
+  const findDevices = async () => {
+    // 1. Try exact model match first
+    const exact = await db.devicePool.findMany({
       where: {
         isEnabled: true,
         bootstrappedAt: { not: null },
@@ -113,12 +129,24 @@ export async function acquireDeviceLease(pinId: string, phoneModel: string) {
       },
       orderBy: { slotIndex: "asc" },
     });
+    if (exact.length) return exact;
 
-  let available = await findMatchingDevices();
+    // 2. Fallback to any enabled, bootstrapped, powered-on ADB device in the pool
+    return db.devicePool.findMany({
+      where: {
+        isEnabled: true,
+        bootstrappedAt: { not: null },
+        adbAddr: { not: null },
+      },
+      orderBy: { slotIndex: "asc" },
+    });
+  };
+
+  let available = await findDevices();
   if (!available.length && Date.now() - lastAutoSyncAt > 60000) {
     lastAutoSyncAt = Date.now();
     await syncDuoPlusDevicePool(phoneModel);
-    available = await findMatchingDevices();
+    available = await findDevices();
   }
   if (!available.length) return null;
 

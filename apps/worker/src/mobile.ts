@@ -17,11 +17,42 @@ const bootstrappedInMemory = new Set<string>();
 
 async function ensureRunnerInstalled(imageId: string) {
   if (bootstrappedInMemory.has(imageId)) return;
+  try {
+    const check = await duoplusPost('/api/v1/cloudPhone/command', {
+      image_id: imageId,
+      command: 'ls /data/local/tmp/rt/run_pin.sh',
+    });
+    if (String(check?.data?.content ?? '').includes('run_pin.sh')) {
+      bootstrappedInMemory.add(imageId);
+      return;
+    }
+  } catch {
+    // Proceed to chunked install if missing
+  }
+
   const b64 = Buffer.from(RUN_PIN_SH_V2, 'utf8').toString('base64');
-  const cmd = `test -x /data/local/tmp/rt/run_pin.sh || (mkdir -p /data/local/tmp/rt && echo '${b64}' | base64 -d > /data/local/tmp/rt/run_pin.sh && chmod 755 /data/local/tmp/rt/run_pin.sh)`;
+  const chunks = b64.match(/.{1,700}/g) || [];
   await duoplusPost('/api/v1/cloudPhone/command', {
     image_id: imageId,
-    command: cmd,
+    command: 'mkdir -p /data/local/tmp/rt',
+  });
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: imageId,
+    command: 'rm -f /data/local/tmp/rt/run_pin.b64 /data/local/tmp/rt/run_pin.sh',
+  });
+  for (const chunk of chunks) {
+    await duoplusPost('/api/v1/cloudPhone/command', {
+      image_id: imageId,
+      command: `echo -n ${chunk} >> /data/local/tmp/rt/run_pin.b64`,
+    });
+  }
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: imageId,
+    command: 'base64 -d /data/local/tmp/rt/run_pin.b64 > /data/local/tmp/rt/run_pin.sh',
+  });
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: imageId,
+    command: 'chmod 755 /data/local/tmp/rt/run_pin.sh',
   });
   bootstrappedInMemory.add(imageId);
 }
@@ -155,16 +186,36 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
 
   const detachedUpload = process.env.UNBIND_PROXY_BEFORE_UPLOAD === 'true';
   const putUrl = await uploadURL(tarKey);
-  const command =
-    'UPLOAD_URL=' +
-    shellQuote(detachedUpload ? '' : putUrl) +
-    ' nohup sh /data/local/tmp/rt/run_pin.sh ' +
-    args.join(' ') +
-    ' >/dev/null 2>&1 </dev/null &';
 
+  const launchScript = [
+    '#!/system/bin/sh',
+    `export UPLOAD_URL=${shellQuote(detachedUpload ? '' : putUrl)}`,
+    `nohup sh /data/local/tmp/rt/run_pin.sh ${args.join(' ')} >/data/local/tmp/rt/last_run.log 2>&1 &`,
+    'exit 0',
+  ].join('\n');
+
+  const launchChunks = Buffer.from(launchScript, 'utf8').toString('base64').match(/.{1,700}/g) || [];
   await duoplusPost('/api/v1/cloudPhone/command', {
     image_id: d.imageId,
-    command,
+    command: 'rm -f /data/local/tmp/rt/launch.b64 /data/local/tmp/rt/launch.sh',
+  });
+  for (const chunk of launchChunks) {
+    await duoplusPost('/api/v1/cloudPhone/command', {
+      image_id: d.imageId,
+      command: `echo -n ${chunk} >> /data/local/tmp/rt/launch.b64`,
+    });
+  }
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: d.imageId,
+    command: 'base64 -d /data/local/tmp/rt/launch.b64 > /data/local/tmp/rt/launch.sh',
+  });
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: d.imageId,
+    command: 'chmod 755 /data/local/tmp/rt/launch.sh',
+  });
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: d.imageId,
+    command: 'sh /data/local/tmp/rt/launch.sh',
   });
 
   const deadline = Date.now() + 240000;
@@ -185,10 +236,9 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
       await d.assertOwned();
       const status = await duoplusPost('/api/v1/cloudPhone/command', {
         image_id: d.imageId,
-        command:
-          'cat ' + shellQuote(folder + '/status') + ' 2>/dev/null || true',
-      });
-      if (String(status.data?.content).trim() === 'done') {
+        command: 'cat ' + shellQuote(folder + '/status'),
+      }).catch(() => null);
+      if (String(status?.data?.content ?? '').trim() === 'done') {
         ready = true;
         break;
       }
@@ -201,21 +251,18 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
       });
       await sleep(2000);
       const file = shellQuote(folder + '.tar.gz');
-      const send =
-        'curl --max-time 90 -fsS -H ' +
-        shellQuote('Content-Type: application/gzip') +
-        ' -T ' +
-        file +
-        ' ' +
-        shellQuote(putUrl) +
-        ' && rm -f ' +
-        file +
-        ' && rm -rf ' +
-        shellQuote(folder);
+      const sendScript = [
+        '#!/system/bin/sh',
+        `curl --max-time 90 -fsS -H 'Content-Type: application/gzip' -T ${file} ${shellQuote(putUrl)} && rm -f ${file} && rm -rf ${shellQuote(folder)}`,
+      ].join('\n');
+      const sendB64 = Buffer.from(sendScript, 'utf8').toString('base64');
       await duoplusPost('/api/v1/cloudPhone/command', {
         image_id: d.imageId,
-        command:
-          'nohup sh -c ' + shellQuote(send) + ' >/dev/null 2>&1 </dev/null &',
+        command: `echo ${sendB64} | base64 -d > /data/local/tmp/rt/send.sh`,
+      });
+      await duoplusPost('/api/v1/cloudPhone/command', {
+        image_id: d.imageId,
+        command: 'nohup sh /data/local/tmp/rt/send.sh >/dev/null 2>&1 &',
       });
       await waitForUpload();
     } finally {
