@@ -24,8 +24,6 @@ function formatErr(e: unknown) {
   return { message: String(e) };
 }
 
-// Queue producers can share the non-blocking connection,
-// but each BullMQ Worker MUST have its own dedicated blocking connection.
 const queueConnection = redis(),
   deviceWorkerConnection = createRedisClient('worker:stakeout-pins'),
   cronWorkerConnection = createRedisClient('worker:stakeout-recurring-schedules'),
@@ -49,7 +47,7 @@ async function execute(job: Job, token?: string) {
     if (!d) {
       if (Date.now() - job.timestamp > 86400000)
         throw new Error('DEVICE_WAIT_TIMEOUT');
-      await job.moveToDelayed(Date.now() + 10000, token);
+      await job.moveToDelayed(Date.now() + 25000, token);
       throw new DelayedError();
     }
     try {
@@ -81,16 +79,19 @@ async function repeat(job: Job) {
   await cloneScheduledRun(job.data.templateScanId, job.id);
 }
 
-const opts = {
-  connection: deviceWorkerConnection,
-  concurrency: Number(process.env.MOBILE_CONCURRENCY ?? 5),
-  lockDuration: 240000,
-};
-
-const deviceWorker = new Worker('stakeout-pins', execute, opts),
+const deviceWorker = new Worker('stakeout-pins', execute, {
+    connection: deviceWorkerConnection,
+    concurrency: Number(process.env.MOBILE_CONCURRENCY ?? 3),
+    lockDuration: 300000,
+    stalledInterval: 120000,
+    drainDelay: 30,
+  }),
   cronWorker = new Worker('stakeout-recurring-schedules', repeat, {
     connection: cronWorkerConnection,
-    concurrency: 2,
+    concurrency: 1,
+    lockDuration: 120000,
+    stalledInterval: 300000,
+    drainDelay: 60,
   });
 
 for (const w of [deviceWorker, cronWorker]) {
@@ -103,8 +104,8 @@ for (const w of [deviceWorker, cronWorker]) {
 const jobOptions = {
   attempts: 3,
   backoff: { type: 'exponential', delay: 4000 },
-  removeOnComplete: { age: 86400 },
-  removeOnFail: { age: 604800 },
+  removeOnComplete: true,
+  removeOnFail: { age: 86400 },
 };
 
 async function dispatch() {
@@ -136,12 +137,17 @@ async function dispatch() {
   }
 }
 
-// Repair a terminal BullMQ failure after a crash, including a job stalled by a dead process.
 async function reconcile() {
+  // Only inspect pins untouched for >10 minutes so active scans do not spam Redis
+  const staleCutoff = new Date(Date.now() - 10 * 60000);
   const pending = await db.gridPin.findMany({
-    where: { status: 'PENDING', scan: { status: 'RUNNING' } },
+    where: {
+      status: 'PENDING',
+      updatedAt: { lt: staleCutoff },
+      scan: { status: 'RUNNING' },
+    },
     orderBy: { updatedAt: 'asc' },
-    take: 250,
+    take: 50,
     select: { id: true },
   });
   for (const p of pending) {
@@ -164,14 +170,14 @@ async function reconcile() {
 }
 
 let busy = false,
-  lastRepair = 0;
+  lastRepair = Date.now();
 
 async function tick() {
   if (busy) return;
   busy = true;
   try {
     await dispatch();
-    if (Date.now() - lastRepair > 60000) {
+    if (Date.now() - lastRepair > 300000) {
       lastRepair = Date.now();
       await reconcile();
     }
@@ -182,7 +188,7 @@ async function tick() {
   }
 }
 
-const timer = setInterval(tick, 5000);
+const timer = setInterval(tick, 10000);
 void tick();
 
 async function close() {

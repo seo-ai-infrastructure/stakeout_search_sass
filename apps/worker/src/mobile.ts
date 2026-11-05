@@ -25,7 +25,9 @@ async function pushFileChunked(
 ) {
   const tmp = path + '.b64';
   const chunks =
-    Buffer.from(content, 'utf8').toString('base64').match(/.{1,700}/g) ?? [];
+    Buffer.from(content, 'utf8')
+      .toString('base64')
+      .match(/.{1,700}/g) ?? [];
   const run = (command: string) =>
     duoplusPost('/api/v1/cloudPhone/command', { image_id: imageId, command });
 
@@ -41,6 +43,15 @@ async function pushFileChunked(
 
 async function ensureRunnerInstalled(imageId: string) {
   if (bootstrappedInMemory.has(imageId)) return;
+
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: imageId,
+    command: `mkdir -p ${RT_DIR}`,
+  });
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: imageId,
+    command: `touch ${RT_DIR}/run_pin.sha`,
+  });
 
   const check = await duoplusPost('/api/v1/cloudPhone/command', {
     image_id: imageId,
@@ -238,13 +249,13 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
       const file = shellQuote(folder + '.tar.gz');
       const sendScript = [
         '#!/system/bin/sh',
-        `nohup sh -c "curl --max-time 90 -fsS -H 'Content-Type: application/gzip' -T ${file} ${shellQuote(putUrl)} && rm -f ${file} && rm -rf ${shellQuote(folder)}" >${RT_DIR}/last_send.log 2>&1 &`,
+        `curl --max-time 90 -fsS -H 'Content-Type: application/gzip' -T ${file} ${shellQuote(putUrl)} && rm -f ${file} && rm -rf ${shellQuote(folder)}`,
         'exit 0',
       ].join('\n');
       await pushFileChunked(d.imageId, `${RT_DIR}/send.sh`, sendScript);
       await duoplusPost('/api/v1/cloudPhone/command', {
         image_id: d.imageId,
-        command: `sh ${RT_DIR}/send.sh`,
+        command: `nohup sh ${RT_DIR}/send.sh >/dev/null 2>&1 &`,
       });
       await waitForUpload();
     } finally {
