@@ -9,6 +9,8 @@ export const bucket = process.env.R2_BUCKET_NAME ?? 'stakeout-artifacts';
 let client: S3Client | undefined;
 export function r2() {
   return (client ??= new S3Client({
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
     region: 'auto',
     endpoint:
       'https://' + process.env.R2_ACCOUNT_ID + '.r2.cloudflarestorage.com',
