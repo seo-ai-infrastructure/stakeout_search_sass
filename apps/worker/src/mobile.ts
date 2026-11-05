@@ -4,77 +4,62 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { x as unpack } from 'tar';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
-import { db, type GridPin, type GridScan } from '@stakeout/db';
+import { type GridPin, type GridScan } from '@stakeout/db';
 import { r2, bucket, put, uploadURL, uploaded } from '@stakeout/core/r2';
 import { duoplusPost, type LeasedDevice } from './duoplus';
 import { parsePinXmlBundle } from './xmlParser';
+import { shellQuote, RUN_PIN_SH_V2 } from '@stakeout/core/runner';
+
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-import { shellQuote } from '@stakeout/core/runner';
 type Pin = GridPin & { scan: GridScan };
-function idMap(key: string) {
-  return JSON.parse(process.env[key] ?? '{}') as Record<string, string>;
+
+const bootstrappedInMemory = new Set<string>();
+
+async function ensureRunnerInstalled(imageId: string) {
+  if (bootstrappedInMemory.has(imageId)) return;
+  const b64 = Buffer.from(RUN_PIN_SH_V2, 'utf8').toString('base64');
+  const cmd = `test -x /data/local/tmp/rt/run_pin.sh || (mkdir -p /data/local/tmp/rt && echo '${b64}' | base64 -d > /data/local/tmp/rt/run_pin.sh && chmod 755 /data/local/tmp/rt/run_pin.sh)`;
+  await duoplusPost('/api/v1/cloudPhone/command', {
+    image_id: imageId,
+    command: cmd,
+  });
+  bootstrappedInMemory.add(imageId);
 }
+
 export async function provision(device: LeasedDevice, p: Pin) {
-  const base = process.env.PROXY_SELLER_BASE_LOGIN!,
-    password = process.env.PROXY_SELLER_PASSWORD!;
-  const isp = /^\d+$/.test(p.scan.ispId)
-    ? p.scan.ispId
-    : idMap('PROXY_ISP_IDS_JSON')[p.scan.ispId];
-  const suffix = isp && /^\d+$/.test(isp) ? '_isp_' + isp : '';
-  const city = p.city.trim().replace(/\s+/g, '-'),
-    sd = idMap('PROXY_STATE_IDS_JSON')[p.stateCode];
-  const choices = [
-    ['ZIP' + (suffix ? '+ISP' : ''), '_zip_' + p.zip + suffix],
-    ['CITY' + (suffix ? '+ISP' : ''), '_city_' + city + suffix],
-  ];
-  if (suffix) choices.push(['CITY', '_city_' + city]);
-  if (sd && /^\d+$/.test(sd)) choices.push(['STATE', '_sd_' + sd]);
-  for (const [rungUsed, target] of choices)
-    for (let i = 0; i < 3; i++) {
-      await device.assertOwned();
-      const port =
-        process.env.PROXY_USE_SLOT_PORT === 'true'
-          ? 10000 + device.slotIndex
-          : Number(process.env.PROXY_PORT ?? 10000);
-      const user =
-        base +
-        '_c_US' +
-        target +
-        '_s_' +
-        randomBytes(6).toString('hex') +
-        '_ttl_10m';
-      await duoplusPost('/api/v1/proxy/update', {
-        id: device.proxyId,
-        host: process.env.PROXY_SELLER_HOST ?? 'us.res.proxy-seller.com',
-        port,
-        user,
-        password,
-        protocol: 'socks5',
-        ip_scan_channel: 'ip2location',
-      });
-      const { data } = await duoplusPost('/api/v1/proxy/check', {
-        proxy_id: device.proxyId,
-        ip_scan_channel: 'ip2location',
-      });
-      if (
-        data?.success &&
-        data.ip &&
-        /^(us|united states)$/i.test(data.country)
-      )
-        return {
-          ip: String(data.ip),
-          city: String(data.city ?? ''),
-          region: String(data.region ?? ''),
-          country: String(data.country),
-          timezone: String(data.timezone ?? ''),
-          rungUsed,
-          ispRequested: p.scan.ispId,
-          ispRuleApplied: !!suffix && rungUsed.includes('ISP'),
-          port,
-        };
+  await device.assertOwned();
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await device.assertOwned();
+    const { data } = await duoplusPost('/api/v1/proxy/check', {
+      id: device.proxyId,
+      proxy_id: device.proxyId,
+      ip_scan_channel: 'ip2location',
+    });
+
+    if (
+      data?.success &&
+      data.ip &&
+      /^(us|united states)$/i.test(String(data.country))
+    ) {
+      return {
+        ip: String(data.ip),
+        city: String(data.city ?? ''),
+        region: String(data.region ?? ''),
+        country: String(data.country),
+        timezone: String(data.timezone ?? ''),
+        rungUsed: 'DEVICE_ROTATING_SLOT',
+        ispRequested: p.scan.ispId,
+        ispRuleApplied: true,
+        port: 10000 + device.slotIndex,
+      };
     }
+    await sleep(2000);
+  }
+
   throw new Error('PROXY_LADDER_EXHAUSTED');
 }
+
 export async function readBundle(key: string, tag: string, dir: string) {
   const obj = await r2().send(
     new GetObjectCommand({ Bucket: bucket, Key: key }),
@@ -121,6 +106,7 @@ export async function readBundle(key: string, tag: string, dir: string) {
     video: await readFile(join(folder, 'video.mp4')),
   };
 }
+
 export async function measureMobile(p: Pin, d: LeasedDevice) {
   const scan = p.scan,
     tagBase = randomBytes(6).toString('hex'),
@@ -134,8 +120,11 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
     mobile_chrome: 'chrome',
   };
   if (!app[scan.targetType]) throw new Error('UNSUPPORTED_SURFACE');
+
+  await ensureRunnerInstalled(d.imageId);
   const proof = await provision(d, p);
   await d.assertOwned();
+
   await duoplusPost('/api/v1/cloudPhone/update', {
     images: [
       {
@@ -152,6 +141,7 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
   });
   await sleep(7000);
   await d.assertOwned();
+
   const args = [
     app[scan.targetType],
     String(p.lat),
@@ -162,6 +152,7 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
     point,
     scan.trackAiOverviews ? '1' : '0',
   ].map(shellQuote);
+
   const detachedUpload = process.env.UNBIND_PROXY_BEFORE_UPLOAD === 'true';
   const putUrl = await uploadURL(tarKey);
   const command =
@@ -170,12 +161,15 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
     ' nohup sh /data/local/tmp/rt/run_pin.sh ' +
     args.join(' ') +
     ' >/dev/null 2>&1 </dev/null &';
+
   await duoplusPost('/api/v1/cloudPhone/command', {
-    image_ids: [d.imageId],
+    image_id: d.imageId,
     command,
   });
+
   const deadline = Date.now() + 240000;
   await sleep(40000);
+
   async function waitForUpload() {
     while (!(await uploaded(tarKey))) {
       if (Date.now() >= deadline) throw new Error('R2_UPLOAD_TIMEOUT');
@@ -183,6 +177,7 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
       await d.assertOwned();
     }
   }
+
   if (detachedUpload) {
     const folder = '/data/local/tmp/rt/' + tag;
     let ready = false;
@@ -232,6 +227,7 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
   } else {
     await waitForUpload();
   }
+
   const dir = await mkdtemp(join(tmpdir(), 'stakeout-pin-'));
   try {
     const b = await readBundle(tarKey, tag, dir);
@@ -243,6 +239,7 @@ export async function measureMobile(p: Pin, d: LeasedDevice) {
       throw new Error('FLAG_CAPTCHA_DETECTED');
     if (b.flags.trim()) throw new Error('FLAG_MAP_DRIFT_OR_CHALLENGE');
     if (!b.video.length) throw new Error('EMPTY_VIDEO');
+
     const result = parsePinXmlBundle(
       b.scroll,
       scan.trackAiOverviews ? b.ai : [],
